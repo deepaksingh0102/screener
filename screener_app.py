@@ -1,6 +1,6 @@
-"""S&P 500 Momentum Screener.
+"""Momentum Screener — S&P 500 or every listed US stock.
 
-Scans every S&P 500 stock on 1-minute Alpaca bars and lists the ones matching
+Scans the chosen universe on 1-minute Alpaca bars and lists the ones matching
 a bullish or a bearish intraday setup:
 
   Bullish: EMA9 > EMA21, MACD > signal, RSI in band, price > session VWAP,
@@ -11,10 +11,17 @@ a bullish or a bearish intraday setup:
 Indicator math mirrors the stock-analyzer app (Wilder's RSI/ADX, EMA 9/21,
 MACD 12/26/9, 30-minute opening range, session-anchored VWAP).
 
+"All listed stocks" runs a two-stage funnel: a snapshot-based volume
+pre-filter (today's volume vs previous day's, >= 0.7x) narrows ~11k listings
+to the day's active names, then the full 7-filter screen runs on those.
+Final relative volume is always recomputed on the 20-day baseline.
+
 Deploy: add this file to the stock-analyzer GitHub repo, then in Streamlit
 Cloud create a new app from the same repo with main file `screener_app.py`
 and copy the same Secrets (APCA_API_KEY_ID, APCA_API_SECRET_KEY, ALPACA_FEED).
 """
+from time import sleep as _sleep
+
 import numpy as np
 import pandas as pd
 import requests
@@ -27,7 +34,7 @@ ET = ZoneInfo("America/New_York")
 SPX_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
 UA = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
 
-st.set_page_config(page_title="S&P 500 Momentum Screener", layout="wide")
+st.set_page_config(page_title="Momentum Screener", layout="wide")
 
 
 # ---------------------------------------------------------------- secrets
@@ -62,18 +69,72 @@ def _feed() -> str:
 # the volume filter accumulates over).
 TF_TRAILING = {"5 minutes": 5, "15 minutes": 15, "1 hour": 60,
                "Since market open": None}
-@st.cache_data(ttl=86400, show_spinner="Loading S&P 500 list…")
-def get_spx():
-    # StringIO: otherwise pd.read_html mistakes the HTML string for a URL
-    # (lxml then throws FileNotFoundError trying to fetch it).
-    # Keep raw Wikipedia symbols (BRK.B, BF.B): Alpaca needs the dots.
-    # (The dash form is only for Yahoo Finance.)
-    from io import StringIO
-    html = requests.get(SPX_URL, headers=UA, timeout=30).text
-    tbl = pd.read_html(StringIO(html))[0]
-    syms = tbl["Symbol"].tolist()
-    names = dict(zip(syms, tbl["Security"]))
+@st.cache_data(ttl=86400, show_spinner="Loading stock universe…")
+def get_universe(mode):
+    """(tickers, names) for the chosen universe.
+
+    "S&P 500": the Wikipedia list. "All listed stocks": every tradable US
+    equity on NYSE/NASDAQ/AMEX from Alpaca's asset list (unit/warrant-style
+    symbols excluded — the volume pre-filter handles the rest).
+    """
+    if mode == "S&P 500":
+        # StringIO: otherwise pd.read_html mistakes the HTML string for a URL
+        # (lxml then throws FileNotFoundError trying to fetch it).
+        # Keep raw Wikipedia symbols (BRK.B, BF.B): Alpaca needs the dots.
+        from io import StringIO
+        html = requests.get(SPX_URL, headers=UA, timeout=30).text
+        tbl = pd.read_html(StringIO(html))[0]
+        syms = tbl["Symbol"].tolist()
+        return syms, dict(zip(syms, tbl["Security"]))
+    r = requests.get("https://api.alpaca.markets/v2/assets",
+                     headers=_headers(),
+                     params={"status": "active", "asset_class": "us_equity"},
+                     timeout=60)
+    if r.status_code in (401, 403):
+        raise AlpacaAuthError(r.status_code)
+    r.raise_for_status()
+    syms, names = [], {}
+    for a in r.json():
+        s = a.get("symbol", "")
+        if (a.get("tradable") and a.get("exchange") in ("NYSE", "NASDAQ", "AMEX")
+                and not any(x in s for x in (".WS", ".U", "$", "+"))):
+            syms.append(s)
+            names[s] = a.get("name", "")
     return syms, names
+
+
+@st.cache_data(ttl=600, show_spinner="Volume pre-filtering all listings…")
+def prefilter_by_volume(_tickers, coarse_min=0.7):
+    """Snapshot funnel for the all-listed universe: keep tickers whose volume
+    so far today is >= coarse_min x yesterday's full-day volume. Coarse by
+    design (yesterday is a noisy baseline) — the real screen recomputes
+    relative volume on the 20-day average before applying the user's minimum.
+    """
+    def one(chunk):
+        try:
+            r = _get_with_backoff("https://data.alpaca.markets/v2/stocks/snapshots",
+                                  _headers(), {"symbols": ",".join(chunk),
+                                               "feed": _feed()}, timeout=60)
+        except requests.HTTPError as e:
+            code = e.response.status_code if e.response is not None else None
+            if code in (401, 403):
+                raise AlpacaAuthError(code)
+            return []
+        keep = []
+        for sym, snap in (r.json() or {}).items():
+            d = (snap or {}).get("dailyBar") or {}
+            p = (snap or {}).get("prevDailyBar") or {}
+            tv, pv = d.get("v") or 0, p.get("v") or 0
+            if pv > 0 and tv / pv >= coarse_min:
+                keep.append(sym)
+        return keep
+
+    chunks = [_tickers[i:i + 100] for i in range(0, len(_tickers), 100)]
+    out = []
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        for keep in ex.map(one, chunks):
+            out.extend(keep)
+    return out
 
 
 # ---------------------------------------------------------------- data
@@ -89,6 +150,24 @@ def _bars_to_df(bars) -> pd.DataFrame:
 
 class AlpacaAuthError(RuntimeError):
     """Alpaca answered 401/403 — the API keys are rejected."""
+
+
+def _get_with_backoff(url, headers, params, timeout=60, tries=3):
+    """GET with exponential backoff on HTTP 429 (Alpaca caps data requests
+    at 200/min; the all-listed universe comes close). Raises HTTPError after
+    the final try."""
+    delay = 2.0
+    r = None
+    for attempt in range(tries):
+        r = requests.get(url, headers=headers, params=params, timeout=timeout)
+        if r.status_code == 429 and attempt < tries - 1:
+            _sleep(delay)
+            delay *= 2
+            continue
+        r.raise_for_status()
+        return r
+    r.raise_for_status()  # pragma: no cover — loop always returns or raises
+    return r
 
 
 def _fetch_chunk(symbols, timeframe, start, end, limit):
@@ -108,9 +187,8 @@ def _fetch_chunk(symbols, timeframe, start, end, limit):
     while True:
         if page_token:
             params["page_token"] = page_token
-        r = requests.get("https://data.alpaca.markets/v2/stocks/bars",
-                         headers=_headers(), params=params, timeout=60)
-        r.raise_for_status()
+        r = _get_with_backoff("https://data.alpaca.markets/v2/stocks/bars",
+                              _headers(), params, timeout=60)
         js = r.json()
         for sym, bars in (js.get("bars") or {}).items():
             if bars:
@@ -138,6 +216,10 @@ def _fetch_multi(tickers, timeframe, start, end, limit, chunk_size):
             code = e.response.status_code if e.response is not None else None
             if code in (401, 403):
                 raise AlpacaAuthError(code)
+            if code == 429:
+                # Already backed off inside _get_with_backoff; splitting would
+                # only multiply requests against a hot rate limit.
+                return {}, [(s, code) for s in chunk]
             if len(chunk) > 1:
                 mid = len(chunk) // 2
                 r1, f1 = one(chunk[:mid])
@@ -278,7 +360,7 @@ def screen(intraday, daily, names, timeframe, relvol_min, adx_min, rsi_lo, rsi_h
 
 
 # ---------------------------------------------------------------- UI
-st.title("S&P 500 Momentum Screener")
+st.title("Momentum Screener")
 st.caption("1-minute Alpaca bars · same indicator math as the stock-analyzer "
            "(EMA 9/21, MACD 12/26/9, Wilder's RSI/ADX 14, 30-min opening range, session VWAP)")
 
@@ -290,6 +372,12 @@ def market_open_now() -> bool:
 
 with st.sidebar:
     st.header("Screen settings")
+    st.selectbox("Universe",
+                 ["S&P 500", "All listed stocks"],
+                 index=1, key="universe",
+                 help="All listed stocks = every tradable NYSE/NASDAQ/AMEX equity (~11k). "
+                      "A snapshot-based volume pre-filter narrows them to the day's active "
+                      "names before the full screen runs — a full scan takes ~1–2 minutes.")
     st.selectbox("Timeframe",
                  ["5 minutes", "15 minutes", "1 hour", "Since market open"],
                  index=3, key="timeframe",
@@ -301,11 +389,13 @@ with st.sidebar:
     st.slider("RSI band", 0, 100, (30, 70), key="rsi_band")
     st.divider()
     if st.button("↻ Refresh now", use_container_width=True):
+        st.session_state["_force_scan"] = True
         st.cache_data.clear()
         st.rerun()
     st.caption(f"Feed: {_feed().upper()} · keys via Streamlit Secrets")
     if market_open_now():
-        st.caption("🟢 Live: re-screens every 30 seconds during market hours.")
+        st.caption("🟢 Live: re-screens during market hours "
+                   "(~3 min per scan on All listed stocks, ~30s on S&P 500).")
     else:
         st.caption("⚪ Market closed — showing the last session (no auto-refresh).")
 
@@ -335,41 +425,67 @@ def screener_body():
     # The fragment re-runs every 30s in market hours; it reads the sidebar
     # settings from session state (never as fragment args) so control changes
     # always take effect.
+    universe_mode = st.session_state.get("universe", "All listed stocks")
     timeframe = st.session_state.get("timeframe", "Since market open")
     relvol_min = st.session_state.get("relvol_min", 1.5)
     adx_min = st.session_state.get("adx_min", 25.0)
     rsi_lo, rsi_hi = st.session_state.get("rsi_band", (30, 70))
+    big = universe_mode != "S&P 500"
+    cadence = 180 if big else 25  # min seconds between full scans
+    scan_key = (universe_mode, timeframe, relvol_min, adx_min, rsi_lo, rsi_hi)
 
-    try:
-        tickers, names = get_spx()
-        intra, intra_failed = fetch_intraday(tickers)
-        daily, daily_failed = fetch_daily(tickers)
-    except AlpacaAuthError as e:
-        code = e.args[0]
-        if code == 401:
-            st.error("Alpaca rejected the API keys (HTTP 401). In **this** app's Settings → Secrets, "
-                     "re-check APCA_API_KEY_ID and APCA_API_SECRET_KEY — secrets don't copy over to a "
-                     "new app automatically, and a typo when pasting is the usual cause.")
-        else:
-            st.error(f"Alpaca refused the request (HTTP {code}) — the keys may lack market-data access.")
-        st.stop()
+    now = datetime.now(ET)
+    force = st.session_state.pop("_force_scan", False)
+    cached = st.session_state.get("_last_scan")
+    last_ts = st.session_state.get("_last_scan_ts")
+    if (cached and cached[0] == scan_key and not force and last_ts
+            and (now - last_ts).total_seconds() < cadence):
+        # Serve the previous scan; a full re-scan runs on the next cycle.
+        bull, bear, session_date, asof, uni_label, n_scan = cached[1:]
+        wait = int(cadence - (now - last_ts).total_seconds())
+        st.caption(f"⏳ Next full scan in ~{wait}s — showing the last completed scan.")
+    else:
+        try:
+            tickers, names = get_universe(universe_mode)
+            if big:
+                candidates = prefilter_by_volume(tickers)
+                uni_note = f"{len(tickers):,} listed · {len(candidates):,} passed volume pre-filter"
+            else:
+                candidates, uni_note = tickers, f"{len(tickers)}"
+            intra, intra_failed = fetch_intraday(candidates)
+            daily, daily_failed = fetch_daily(candidates)
+        except AlpacaAuthError as e:
+            code = e.args[0]
+            if code == 401:
+                st.error("Alpaca rejected the API keys (HTTP 401). In **this** app's Settings → Secrets, "
+                         "re-check APCA_API_KEY_ID and APCA_API_SECRET_KEY — secrets don't copy over to a "
+                         "new app automatically, and a typo when pasting is the usual cause.")
+            else:
+                st.error(f"Alpaca refused the request (HTTP {code}) — the keys may lack market-data access.")
+            st.stop()
 
-    skipped = sorted({t for t, _ in intra_failed} | {t for t, _ in daily_failed})
-    if skipped:
-        st.warning(f"Skipped {len(skipped)} tickers Alpaca wouldn't serve: "
-                   f"{', '.join(skipped[:10])}{' …' if len(skipped) > 10 else ''}")
+        skipped = sorted({t for t, _ in intra_failed} | {t for t, _ in daily_failed})
+        if skipped:
+            st.warning(f"Skipped {len(skipped)} tickers Alpaca wouldn't serve: "
+                       f"{', '.join(skipped[:10])}{' …' if len(skipped) > 10 else ''}")
 
-    bull, bear, session_date = screen(intra, daily, names, timeframe,
-                                     relvol_min, adx_min, rsi_lo, rsi_hi)
-    if session_date is None:
-        st.error("Alpaca returned no bars for any ticker — check the app logs, "
-                 "or try Refresh now in a moment.")
-        st.stop()
+        bull, bear, session_date = screen(intra, daily, names, timeframe,
+                                         relvol_min, adx_min, rsi_lo, rsi_hi)
+        if session_date is None:
+            st.error("Alpaca returned no bars for any ticker — check the app logs, "
+                     "or try Refresh now in a moment.")
+            st.stop()
 
-    asof = (f"{session_date} · last {timeframe}" if timeframe != "Since market open"
-            else f"{session_date} · since market open")
+        asof = (f"{session_date} · last {timeframe}" if timeframe != "Since market open"
+                else f"{session_date} · since market open")
+        uni_label = uni_note
+        n_scan = len(intra)
+        st.session_state["_last_scan"] = (scan_key, bull, bear, session_date,
+                                          asof, uni_label, n_scan)
+        st.session_state["_last_scan_ts"] = datetime.now(ET)
+
     refreshed = datetime.now(ET).strftime("%H:%M:%S ET")
-    st.info(f"**{len(intra)}** tickers scanned · session **{asof}** · "
+    st.info(f"**{n_scan}** tickers scanned · {uni_label} · session **{asof}** · "
             f"**{len(bull)}** bullish / **{len(bear)}** bearish matches · "
             f"updated {refreshed}", icon="📊")
 
@@ -403,7 +519,10 @@ price inside the 9:30–10:00 opening range · relative volume ≥ minimum · AD
 
 Relative volume = the selected timeframe's volume ÷ (20-day average daily volume,
 prorated for that many minutes). "15 minutes" = surging in the last 15 minutes; "Since market
-open" = session-long volume buildup. ADX measures trend *strength* (>25 = conviction); it says nothing
+open" = session-long volume buildup. On the "All listed stocks" universe a snapshot-based
+pre-filter first keeps only names trading ≥ 0.7x yesterday's volume, so the full screen runs
+on the day's active names; the final relative volume is always computed on the 20-day baseline.
+ADX measures trend *strength* (>25 = conviction); it says nothing
 about direction. This is a setup screen, not a prediction — 1-minute directional calls
 test around a coin flip; use these as candidates for your own read.
 """)
