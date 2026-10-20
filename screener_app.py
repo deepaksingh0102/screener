@@ -92,15 +92,33 @@ class AlpacaAuthError(RuntimeError):
 
 
 def _fetch_chunk(symbols, timeframe, start, end, limit):
-    """One multi-symbol bars request. Raises requests.HTTPError on failure."""
+    """One multi-symbol bars request, following next_page_token until done.
+
+    Alpaca's `limit` is the TOTAL bars in one page across ALL symbols in the
+    request (not per symbol), so a 200-ticker request for 3 days of 1-minute
+    bars (~234k bars) returns only the first ~10k unless pages are followed —
+    most tickers simply never appear in the response. Raises
+    requests.HTTPError on failure.
+    """
+    out = {}
+    page_token = None
     params = {"symbols": ",".join(symbols), "timeframe": timeframe,
               "start": start.isoformat(), "end": end.isoformat(),
-              "limit": limit, "feed": _feed(), "adjustment": "raw", "sort": "desc"}
-    r = requests.get("https://data.alpaca.markets/v2/stocks/bars",
-                     headers=_headers(), params=params, timeout=60)
-    r.raise_for_status()
-    return {sym: _bars_to_df(bars)
-            for sym, bars in (r.json().get("bars") or {}).items() if bars}
+              "limit": limit, "feed": _feed(), "adjustment": "raw", "sort": "asc"}
+    while True:
+        if page_token:
+            params["page_token"] = page_token
+        r = requests.get("https://data.alpaca.markets/v2/stocks/bars",
+                         headers=_headers(), params=params, timeout=60)
+        r.raise_for_status()
+        js = r.json()
+        for sym, bars in (js.get("bars") or {}).items():
+            if bars:
+                out.setdefault(sym, []).extend(bars)
+        page_token = js.get("next_page_token")
+        if not page_token:
+            break
+    return {sym: _bars_to_df(bars) for sym, bars in out.items()}
 
 
 def _fetch_multi(tickers, timeframe, start, end, limit, chunk_size):
@@ -137,17 +155,27 @@ def _fetch_multi(tickers, timeframe, start, end, limit, chunk_size):
 
 @st.cache_data(ttl=30, show_spinner=False)
 def fetch_intraday(_tickers):
-    """1-min bars, refreshed on every 30s cycle (TTL 30)."""
+    """1-min bars, refreshed on every 30s cycle (TTL 30).
+
+    Chunks of 25 symbols: one full session is 390 bars, so 25 x 390 = 9,750
+    fits a single 10k-bar page (pagination is the safety net). Starts at
+    today's open; if no session is found (weekend, pre-open, holiday), retries
+    with a 5-day lookback so the last session still appears.
+    """
     end = datetime.now(ET)
-    start = (end - timedelta(days=3)).replace(hour=0, minute=0, second=0, microsecond=0)
-    return _fetch_multi(_tickers, "1Min", start, end, 10000, 200)
+    today = end.replace(hour=0, minute=0, second=0, microsecond=0)
+    out, failed = _fetch_multi(_tickers, "1Min", today, end, 10000, 25)
+    if not out:
+        out, failed = _fetch_multi(_tickers, "1Min",
+                                   today - timedelta(days=5), end, 10000, 25)
+    return out, failed
 
 
 @st.cache_data(ttl=3600, show_spinner="Pulling daily bars for volume baselines…")
 def fetch_daily(_tickers):
     end = datetime.now(ET)
     start = end - timedelta(days=45)
-    return _fetch_multi(_tickers, "1D", start, end, 100, 150)
+    return _fetch_multi(_tickers, "1D", start, end, 100, 80)
 
 
 # ---------------------------------------------------------------- indicators (vectorized Wilder's)
