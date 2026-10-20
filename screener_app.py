@@ -55,6 +55,13 @@ def _feed() -> str:
 
 
 # ---------------------------------------------------------------- universe
+# Timeframe labels -> trailing minutes the screen evaluates (None = whole
+# session since market open). Mirrors the stock-analyzer's "Chart timeframe":
+# candles stay 1-minute, the selector picks the window, and the indicators
+# always carry the full session's warm-up (the window only sets which minutes
+# the volume filter accumulates over).
+TF_TRAILING = {"5 minutes": 5, "15 minutes": 15, "1 hour": 60,
+               "Since market open": None}
 @st.cache_data(ttl=86400, show_spinner="Loading S&P 500 list…")
 def get_spx():
     # StringIO: otherwise pd.read_html mistakes the HTML string for a URL
@@ -166,19 +173,20 @@ def adx_vec(high: pd.Series, low: pd.Series, close: pd.Series, n: int = 14):
 
 
 # ---------------------------------------------------------------- screen
-def screen(intraday, daily, names, window_end, relvol_min, adx_min, rsi_lo, rsi_hi):
+def screen(intraday, daily, names, timeframe, relvol_min, adx_min, rsi_lo, rsi_hi):
     bull, bear, session_date = [], [], None
+    trail = TF_TRAILING[timeframe]
     for t, df in intraday.items():
         try:
             if df.empty:
                 continue
             session_date = df.index.date.max()
-            day = df[df.index.date == session_date]
-            sess = day.between_time("09:30", window_end)
-            if len(sess) < 29:  # ADX(14) needs 2n+1 bars
+            # Full regular session: indicators get the whole session's warm-up.
+            day = df[df.index.date == session_date].between_time("09:30", "16:00")
+            if len(day) < 29:  # ADX(14) needs 2n+1 bars
                 continue
-            o, h, l, c = sess["Open"], sess["High"], sess["Low"], sess["Close"]
-            v = sess["Volume"].fillna(0.0)
+            o, h, l, c = day["Open"], day["High"], day["Low"], day["Close"]
+            v = day["Volume"].fillna(0.0)
 
             ema9 = c.ewm(span=9, adjust=False).mean().iloc[-1]
             ema21 = c.ewm(span=21, adjust=False).mean().iloc[-1]
@@ -192,7 +200,7 @@ def screen(intraday, daily, names, window_end, relvol_min, adx_min, rsi_lo, rsi_
             adx = adx.iloc[-1]
             price = float(c.iloc[-1])
 
-            orw = sess.between_time("09:30", "10:00")
+            orw = day.between_time("09:30", "10:00")
             orh, orl = float(orw["High"].max()), float(orw["Low"].min())
 
             d = daily.get(t)
@@ -204,7 +212,12 @@ def screen(intraday, daily, names, window_end, relvol_min, adx_min, rsi_lo, rsi_
                 vols = d["Volume"].iloc[:-1].tail(20)
                 if len(vols) >= 10:
                     avg_vol = float(vols.mean())
-            relvol = (float(v.sum()) / (avg_vol * len(sess) / 390.0)
+            # Relative volume over the trailing window vs the same slice of a
+            # normal day (prorated 20-day average). This is what the timeframe
+            # selector changes: "15 minutes" = hot in the last 15 minutes.
+            win = day.tail(trail) if trail else day
+            win_min = max((win.index[-1] - win.index[0]).total_seconds() / 60 + 1, 1)
+            relvol = (float(win["Volume"].fillna(0.0).sum()) / (avg_vol * win_min / 390.0)
                       if avg_vol and avg_vol > 0 else np.nan)
 
             row = dict(Ticker=t, Name=names.get(t, ""), Price=round(price, 2),
@@ -249,12 +262,12 @@ def market_open_now() -> bool:
 
 with st.sidebar:
     st.header("Screen settings")
-    st.selectbox("Evaluate as of",
-                 ["10:00", "11:00", "12:00", "13:00", "Full session"],
-                 index=1, key="window_label")
-    st.session_state["window_end"] = ("16:00"
-                                      if st.session_state["window_label"] == "Full session"
-                                      else st.session_state["window_label"])
+    st.selectbox("Timeframe",
+                 ["5 minutes", "15 minutes", "1 hour", "Since market open"],
+                 index=3, key="timeframe",
+                 help="Trailing window the screen evaluates. Like the stock-analyzer's "
+                      "Chart timeframe: indicators always carry the full session's warm-up; "
+                      "the window sets the minutes the relative-volume filter accumulates over.")
     st.number_input("Min relative volume", 0.5, 10.0, 1.5, 0.1, key="relvol_min")
     st.number_input("Min ADX", 10.0, 50.0, 25.0, 1.0, key="adx_min")
     st.slider("RSI band", 0, 100, (30, 70), key="rsi_band")
@@ -294,7 +307,7 @@ def screener_body():
     # The fragment re-runs every 30s in market hours; it reads the sidebar
     # settings from session state (never as fragment args) so control changes
     # always take effect.
-    window_end = st.session_state.get("window_end", "11:00")
+    timeframe = st.session_state.get("timeframe", "Since market open")
     relvol_min = st.session_state.get("relvol_min", 1.5)
     adx_min = st.session_state.get("adx_min", 25.0)
     rsi_lo, rsi_hi = st.session_state.get("rsi_band", (30, 70))
@@ -318,41 +331,40 @@ def screener_body():
         st.warning(f"Skipped {len(skipped)} tickers Alpaca wouldn't serve: "
                    f"{', '.join(skipped[:10])}{' …' if len(skipped) > 10 else ''}")
 
-    bull, bear, session_date = screen(intra, daily, names, window_end,
+    bull, bear, session_date = screen(intra, daily, names, timeframe,
                                      relvol_min, adx_min, rsi_lo, rsi_hi)
     if session_date is None:
         st.error("Alpaca returned no bars for any ticker — check the app logs, "
                  "or try Refresh now in a moment.")
         st.stop()
 
-    asof = (f"{session_date} as of {window_end} ET" if window_end != "16:00"
-            else f"{session_date} full session")
+    asof = (f"{session_date} · last {timeframe}" if timeframe != "Since market open"
+            else f"{session_date} · since market open")
     refreshed = datetime.now(ET).strftime("%H:%M:%S ET")
     st.info(f"**{len(intra)}** tickers scanned · session **{asof}** · "
             f"**{len(bull)}** bullish / **{len(bear)}** bearish matches · "
             f"updated {refreshed}", icon="📊")
-    if window_end == "10:00":
-        st.caption("⚠️ Early window: indicators run on ~30 bars, so EMA/MACD/ADX are on thin warmup.")
 
+    tf_slug = timeframe.replace(" ", "_")
     tab_bull, tab_bear = st.tabs([f"🟢 Bullish ({len(bull)})", f"🔴 Bearish ({len(bear)})"])
     with tab_bull:
         if len(bull):
             st.dataframe(bull, column_config=_cols, use_container_width=True, hide_index=True)
             st.download_button("Download bullish CSV",
                                bull.to_csv(index=False).encode(),
-                               f"bullish_{session_date}_{window_end.replace(':', '')}.csv",
+                               f"bullish_{session_date}_{tf_slug}.csv",
                                "text/csv")
         else:
-            st.write("No bullish matches — try loosening relative volume or ADX, or an earlier window.")
+            st.write("No bullish matches — try loosening relative volume or ADX, or a wider timeframe.")
     with tab_bear:
         if len(bear):
             st.dataframe(bear, column_config=_cols, use_container_width=True, hide_index=True)
             st.download_button("Download bearish CSV",
                                bear.to_csv(index=False).encode(),
-                               f"bearish_{session_date}_{window_end.replace(':', '')}.csv",
+                               f"bearish_{session_date}_{tf_slug}.csv",
                                "text/csv")
         else:
-            st.write("No bearish matches — try loosening relative volume or ADX, or an earlier window.")
+            st.write("No bearish matches — try loosening relative volume or ADX, or a wider timeframe.")
 
     with st.expander("How the filters work"):
         st.markdown("""
@@ -361,8 +373,9 @@ price inside the 9:30–10:00 opening range · relative volume ≥ minimum · AD
 
 **Bearish:** the mirror — EMA9 < EMA21 · MACD < signal · price < VWAP, everything else the same.
 
-Relative volume = today's volume so far ÷ (20-day average daily volume, prorated for
-elapsed session time). ADX measures trend *strength* (>25 = conviction); it says nothing
+Relative volume = the selected timeframe's volume ÷ (20-day average daily volume,
+prorated for that many minutes). "15 minutes" = surging in the last 15 minutes; "Since market
+open" = session-long volume buildup. ADX measures trend *strength* (>25 = conviction); it says nothing
 about direction. This is a setup screen, not a prediction — 1-minute directional calls
 test around a coin flip; use these as candidates for your own read.
 """)
