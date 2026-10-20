@@ -330,6 +330,15 @@ def adx_vec(high: pd.Series, low: pd.Series, close: pd.Series, n: int = 14):
     return dx.ewm(alpha=1.0 / n, adjust=False).mean(), pdi, mdi
 
 
+def stoch_kd(high: pd.Series, low: pd.Series, close: pd.Series,
+             k: int = 14, d: int = 3):
+    """Stochastic %K / %D — the price-action book's momentum-shift gauge."""
+    ll = low.rolling(k).min()
+    hh = high.rolling(k).max()
+    pk = 100.0 * (close - ll) / (hh - ll).replace(0.0, np.nan)
+    return pk, pk.rolling(d).mean()
+
+
 # ---------------------------------------------------------------- screen
 def screen(intraday, daily, names, timeframe, relvol_min, adx_min, rsi_lo, rsi_hi):
     bull, bear, session_date = [], [], None
@@ -407,6 +416,120 @@ def screen(intraday, daily, names, timeframe, relvol_min, adx_min, rsi_lo, rsi_h
     return b, br, session_date
 
 
+def breakout_screen(intraday, daily, names, timeframe, relvol_min, rsi_lo, rsi_hi):
+    """The price-action book's breakout: price through the prior-day high/low
+    (its AHPMB level) or the opening-range edge, with EMA 9/21 aligned, a
+    stochastic momentum shift (fresh %K/%D cross, or %K beyond 80/20), real
+    volume, and no wick rejection on the crossing candle. The most recent
+    cross must be within 30 bars and price must still hold the level."""
+    bull, bear, session_date = [], [], None
+    trail = TF_TRAILING[timeframe]
+    for t, df in intraday.items():
+        try:
+            if df.empty:
+                continue
+            session_date = df.index.date.max()
+            day = df[df.index.date == session_date].between_time("09:30", "16:00")
+            if len(day) < 20:  # stochastic(14) + %D(3) need warm-up
+                continue
+            o, h, l, c = day["Open"], day["High"], day["Low"], day["Close"]
+            price = float(c.iloc[-1])
+            ema9 = c.ewm(span=9, adjust=False).mean().iloc[-1]
+            ema21 = c.ewm(span=21, adjust=False).mean().iloc[-1]
+            rsi = wilder_rsi(c).iloc[-1]
+            pk, pd_ = stoch_kd(h, l, c)
+            k_now, d_now = float(pk.iloc[-1]), float(pd_.iloc[-1])
+            up_cross = dn_cross = False
+            for i in range(max(1, len(pk) - 5), len(pk)):
+                if pk.iloc[i - 1] <= pd_.iloc[i - 1] and pk.iloc[i] > pd_.iloc[i]:
+                    up_cross = True
+                if pk.iloc[i - 1] >= pd_.iloc[i - 1] and pk.iloc[i] < pd_.iloc[i]:
+                    dn_cross = True
+
+            orw = day.between_time("09:30", "10:00")
+            orh, orl = float(orw["High"].max()), float(orw["Low"].min())
+            after_or = (day.index.time > time(10, 0))  # OR breaks count post-10:00
+
+            d = daily.get(t)
+            pdh = pdl = prev_close = avg_vol = np.nan
+            if d is not None and len(d) >= 2:
+                pdh, pdl = float(d["High"].iloc[-2]), float(d["Low"].iloc[-2])
+                prev_close = float(d["Close"].iloc[-2])
+                vols = d["Volume"].iloc[:-1].tail(20)
+                if len(vols) >= 10:
+                    avg_vol = float(vols.mean())
+            pct_chg = 100 * (price / prev_close - 1) if prev_close else np.nan
+            win = day.tail(trail) if trail else day
+            win_min = max((win.index[-1] - win.index[0]).total_seconds() / 60 + 1, 1)
+            relvol = (float(win["Volume"].fillna(0.0).sum()) / (avg_vol * win_min / 390.0)
+                      if avg_vol and avg_vol > 0 else np.nan)
+
+            if not (rsi_lo < rsi < rsi_hi) or not (relvol >= relvol_min):
+                continue
+
+            def last_cross(level, above, mask=None):
+                """(bars_ago, rejection-wick share) of the most recent close
+                crossing `level`, else None."""
+                cl = c.values
+                pos = np.arange(len(cl)) if mask is None else np.where(mask)[0]
+                for i in pos[::-1]:
+                    if i == 0:
+                        continue
+                    if above and cl[i] > level and cl[i - 1] <= level:
+                        rng = float(h.iloc[i] - l.iloc[i])
+                        wick = (float(h.iloc[i] - max(o.iloc[i], c.iloc[i])) / rng
+                                if rng > 0 else 0.0)
+                        return len(cl) - 1 - i, wick
+                    if not above and cl[i] < level and cl[i - 1] >= level:
+                        rng = float(h.iloc[i] - l.iloc[i])
+                        wick = (float(min(o.iloc[i], c.iloc[i]) - l.iloc[i]) / rng
+                                if rng > 0 else 0.0)
+                        return len(cl) - 1 - i, wick
+                return None
+
+            base = dict(Ticker=t, Name=names.get(t, ""), Price=round(price, 2),
+                        Chg_Pct=round(pct_chg, 2), EMA9=round(ema9, 2),
+                        EMA21=round(ema21, 2), Stoch_K=round(k_now, 1),
+                        Stoch_D=round(d_now, 1), RSI=round(rsi, 1),
+                        RelVol=round(relvol, 2))
+            if ema9 > ema21 and (up_cross or k_now > 80):
+                # The highest level with a recent cross decides: if that
+                # cross was wick-rejected, the ticker is out — don't fall
+                # through to a lower level crossed on the way up.
+                for lvl_name, lvl, mask in (("PDH", pdh, None),
+                                            ("OR-High", orh, after_or)):
+                    if np.isnan(lvl) or price <= lvl:
+                        continue
+                    hit = last_cross(lvl, True, mask)
+                    if not hit or hit[0] > 30:
+                        continue
+                    if hit[1] <= 0.5:
+                        bull.append({**base, "Level": lvl_name, "Bars_Ago": hit[0],
+                                     "Wick_Pct": round(100 * hit[1])})
+                    break
+            if ema9 < ema21 and (dn_cross or k_now < 20):
+                for lvl_name, lvl, mask in (("PDL", pdl, None),
+                                            ("OR-Low", orl, after_or)):
+                    if np.isnan(lvl) or price >= lvl:
+                        continue
+                    hit = last_cross(lvl, False, mask)
+                    if not hit or hit[0] > 30:
+                        continue
+                    if hit[1] <= 0.5:
+                        bear.append({**base, "Level": lvl_name, "Bars_Ago": hit[0],
+                                     "Wick_Pct": round(100 * hit[1])})
+                    break
+        except Exception:
+            continue
+    b = pd.DataFrame(bull)
+    if len(b):
+        b = b.sort_values("RelVol", ascending=False)
+    br = pd.DataFrame(bear)
+    if len(br):
+        br = br.sort_values("RelVol", ascending=False)
+    return b, br, session_date
+
+
 # ---------------------------------------------------------------- UI
 st.title("Momentum Screener")
 st.caption("1-minute Alpaca bars · same indicator math as the stock-analyzer "
@@ -420,6 +543,11 @@ def market_open_now() -> bool:
 
 with st.sidebar:
     st.header("Screen settings")
+    st.selectbox("Screen mode", ["Momentum", "Breakout"], index=0, key="screen_mode",
+                 help="Momentum = the 7-filter trend screen (EMA/MACD/RSI/VWAP/opening range/ADX). "
+                      "Breakout = the price-action book's setup: a break of the prior-day high/low "
+                      "or the opening-range edge, with EMA 9/21 aligned, a stochastic momentum shift, "
+                      "real volume, and no wick rejection on the crossing candle.")
     st.selectbox("Universe",
                  ["S&P 500", "Top 1000 by market cap", "All listed stocks"],
                  index=1, key="universe",
@@ -467,6 +595,20 @@ _cols = {"Ticker": st.column_config.TextColumn("Ticker"),
          "ADX": st.column_config.NumberColumn("ADX", format="%.1f"),
          "RelVol": st.column_config.NumberColumn("RelVol", format="%.2fx")}
 
+_cols_bo = {"Ticker": st.column_config.TextColumn("Ticker"),
+            "Name": st.column_config.TextColumn("Name"),
+            "Price": st.column_config.NumberColumn("Price", format="$%.2f"),
+            "Chg_Pct": st.column_config.NumberColumn("Chg %", format="%.2f%%"),
+            "Level": st.column_config.TextColumn("Level"),
+            "Bars_Ago": st.column_config.NumberColumn("Bars Ago", format="%d"),
+            "Stoch_K": st.column_config.NumberColumn("%K", format="%.1f"),
+            "Stoch_D": st.column_config.NumberColumn("%D", format="%.1f"),
+            "EMA9": st.column_config.NumberColumn("EMA9", format="%.2f"),
+            "EMA21": st.column_config.NumberColumn("EMA21", format="%.2f"),
+            "RSI": st.column_config.NumberColumn("RSI", format="%.1f"),
+            "Wick_Pct": st.column_config.NumberColumn("Wick %", format="%.0f%%"),
+            "RelVol": st.column_config.NumberColumn("RelVol", format="%.2fx")}
+
 
 @st.fragment(run_every=30 if market_open_now() else None)
 def screener_body():
@@ -474,6 +616,8 @@ def screener_body():
     # settings from session state (never as fragment args) so control changes
     # always take effect.
     universe_mode = st.session_state.get("universe", "Top 1000 by market cap")
+    mode = st.session_state.get("screen_mode", "Momentum")
+    breakout = mode == "Breakout"
     timeframe = st.session_state.get("timeframe", "Since market open")
     relvol_min = st.session_state.get("relvol_min", 1.5)
     adx_min = st.session_state.get("adx_min", 25.0)
@@ -481,7 +625,8 @@ def screener_body():
     big = universe_mode == "All listed stocks"
     mid = universe_mode == "Top 1000 by market cap"
     cadence = 180 if big else (60 if mid else 25)  # min seconds between full scans
-    scan_key = (universe_mode, timeframe, relvol_min, adx_min, rsi_lo, rsi_hi)
+    scan_key = (mode, universe_mode, timeframe, relvol_min,
+                0 if breakout else adx_min, rsi_lo, rsi_hi)
 
     now = datetime.now(ET)
     force = st.session_state.pop("_force_scan", False)
@@ -518,8 +663,12 @@ def screener_body():
             st.warning(f"Skipped {len(skipped)} tickers Alpaca wouldn't serve: "
                        f"{', '.join(skipped[:10])}{' …' if len(skipped) > 10 else ''}")
 
-        bull, bear, session_date = screen(intra, daily, names, timeframe,
-                                         relvol_min, adx_min, rsi_lo, rsi_hi)
+        if breakout:
+            bull, bear, session_date = breakout_screen(intra, daily, names, timeframe,
+                                                       relvol_min, rsi_lo, rsi_hi)
+        else:
+            bull, bear, session_date = screen(intra, daily, names, timeframe,
+                                              relvol_min, adx_min, rsi_lo, rsi_hi)
         if session_date is None:
             st.error("Alpaca returned no bars for any ticker — check the app logs, "
                      "or try Refresh now in a moment.")
@@ -534,41 +683,67 @@ def screener_body():
         st.session_state["_last_scan_ts"] = datetime.now(ET)
 
     refreshed = datetime.now(ET).strftime("%H:%M:%S ET")
-    st.info(f"**{n_scan}** tickers scanned · {uni_label} · session **{asof}** · "
+    st.info(f"**{n_scan}** tickers scanned · {uni_label} · **{mode}** · session **{asof}** · "
             f"**{len(bull)}** bullish / **{len(bear)}** bearish matches · "
             f"updated {refreshed}", icon="📊")
     _now = datetime.now(ET)
     if session_date == _now.date() and _now.time() < time(10, 0):
-        st.caption("⏳ Early session: the screen needs 29 bars before ADX can compute, so the "
-                   "earliest any stock can qualify is ~09:59 ET — and the opening range doesn't "
-                   "complete until 10:00 ET. An empty list before then is expected, not a glitch.")
+        if breakout:
+            st.caption("⏳ Early session: the stochastic needs ~17 bars of warm-up, so the earliest "
+                       "breakouts can qualify is ~09:50 ET — and opening-range breaks only count after "
+                       "10:00 ET. An empty list before then is expected, not a glitch.")
+        else:
+            st.caption("⏳ Early session: the screen needs 29 bars before ADX can compute, so the "
+                       "earliest any stock can qualify is ~09:59 ET — and the opening range doesn't "
+                       "complete until 10:00 ET. An empty list before then is expected, not a glitch.")
 
     tf_slug = timeframe.replace(" ", "_")
+    mode_slug = "breakout" if breakout else "momentum"
+    cols = _cols_bo if breakout else _cols
     TOP_N = 10  # display cap per tab (tables are RelVol-sorted; CSVs stay full)
     bull_show, bear_show = bull.head(TOP_N), bear.head(TOP_N)
     tab_bull, tab_bear = st.tabs([f"🟢 Bullish (top {len(bull_show)} of {len(bull)})",
                                   f"🔴 Bearish (top {len(bear_show)} of {len(bear)})"])
     with tab_bull:
         if len(bull):
-            st.dataframe(bull_show, column_config=_cols, use_container_width=True, hide_index=True)
+            st.dataframe(bull_show, column_config=cols, use_container_width=True, hide_index=True)
             st.download_button(f"Download full bullish CSV ({len(bull)})",
                                bull.to_csv(index=False).encode(),
-                               f"bullish_{session_date}_{tf_slug}.csv",
+                               f"bullish_{mode_slug}_{session_date}_{tf_slug}.csv",
                                "text/csv")
         else:
-            st.write("No bullish matches — try loosening relative volume or ADX, or a wider timeframe.")
+            st.write("No bullish matches — try loosening relative volume"
+                     + (" or the RSI band." if breakout else " or ADX, or a wider timeframe."))
     with tab_bear:
         if len(bear):
-            st.dataframe(bear_show, column_config=_cols, use_container_width=True, hide_index=True)
+            st.dataframe(bear_show, column_config=cols, use_container_width=True, hide_index=True)
             st.download_button(f"Download full bearish CSV ({len(bear)})",
                                bear.to_csv(index=False).encode(),
-                               f"bearish_{session_date}_{tf_slug}.csv",
+                               f"bearish_{mode_slug}_{session_date}_{tf_slug}.csv",
                                "text/csv")
         else:
-            st.write("No bearish matches — try loosening relative volume or ADX, or a wider timeframe.")
+            st.write("No bearish matches — try loosening relative volume"
+                     + (" or the RSI band." if breakout else " or ADX, or a wider timeframe."))
 
     with st.expander("How the filters work"):
-        st.markdown("""
+        if breakout:
+            st.markdown("""
+**Breakout mode** — the price-action book's setup. **Bullish:** price has broken the
+prior-day high (PDH — the book's after-hours/pre-market level) or the opening-range high
+within the last 30 bars and still holds above it · EMA9 > EMA21 · stochastic momentum shift
+(%K crossed above %D in the last 5 bars, or %K > 80) · relative volume ≥ minimum · RSI inside
+the band · and the crossing candle's upper wick ≤ 50% of its range (the book's false-breakout
+tell: long wicks on the breakout candle = sellers rejecting the break).
+
+**Bearish:** the mirror — break of the prior-day low or opening-range low, EMA9 < EMA21,
+%K cross down or %K < 20, lower-wick check on the crossing candle. Opening-range breaks only
+count after 10:00 ET (the range must exist before it can break). The book's stop is just below
+the broken level; its target is the next support/resistance. ADX and MACD are not part of the
+book's recipe and don't gate this mode. This is a setup screen, not a prediction — 1-minute
+directional calls test around a coin flip; use these as candidates for your own read.
+""")
+        else:
+            st.markdown("""
 **Bullish:** EMA9 > EMA21 · MACD > signal · RSI inside the band · price > session VWAP ·
 price inside the 9:30–10:00 opening range · relative volume ≥ minimum · ADX > minimum.
 
