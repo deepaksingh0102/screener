@@ -69,23 +69,34 @@ def _feed() -> str:
 # the volume filter accumulates over).
 TF_TRAILING = {"5 minutes": 5, "15 minutes": 15, "1 hour": 60,
                "Since market open": None}
-@st.cache_data(ttl=86400, show_spinner="Loading stock universe…")
-def get_universe(mode):
-    """(tickers, names) for the chosen universe.
+NASDAQ_SCREENER_URL = "https://api.nasdaq.com/api/screener/stocks"
 
-    "S&P 500": the Wikipedia list. "All listed stocks": every tradable US
-    equity on NYSE/NASDAQ/AMEX from Alpaca's asset list (unit/warrant-style
-    symbols excluded — the volume pre-filter handles the rest).
-    """
-    if mode == "S&P 500":
-        # StringIO: otherwise pd.read_html mistakes the HTML string for a URL
-        # (lxml then throws FileNotFoundError trying to fetch it).
-        # Keep raw Wikipedia symbols (BRK.B, BF.B): Alpaca needs the dots.
-        from io import StringIO
-        html = requests.get(SPX_URL, headers=UA, timeout=30).text
-        tbl = pd.read_html(StringIO(html))[0]
-        syms = tbl["Symbol"].tolist()
-        return syms, dict(zip(syms, tbl["Security"]))
+
+@st.cache_data(ttl=86400, show_spinner="Loading market caps…")
+def get_market_caps():
+    """symbol -> market cap (USD) for US listings, from Nasdaq's public
+    screener (no key needed). Nasdaq writes class shares as BF/A; Alpaca
+    wants BF.B, hence the normalization. Rows with no cap are dropped."""
+    r = requests.get(NASDAQ_SCREENER_URL,
+                     params={"tableonly": "true", "limit": 25, "offset": 0,
+                             "download": "true"},
+                     headers={**UA, "Accept": "application/json"}, timeout=60)
+    r.raise_for_status()
+    caps = {}
+    for row in (r.json().get("data") or {}).get("rows") or []:
+        sym = (row.get("symbol") or "").replace("/", ".")
+        try:
+            cap = float(row.get("marketCap") or 0)
+        except (TypeError, ValueError):
+            cap = 0.0
+        if sym and cap > 0:
+            caps[sym] = cap
+    return caps
+
+
+def _alpaca_listings():
+    """Every tradable US equity on NYSE/NASDAQ/AMEX (unit/warrant-style
+    symbols excluded)."""
     r = requests.get("https://api.alpaca.markets/v2/assets",
                      headers=_headers(),
                      params={"status": "active", "asset_class": "us_equity"},
@@ -95,12 +106,49 @@ def get_universe(mode):
     r.raise_for_status()
     syms, names = [], {}
     for a in r.json():
-        s = a.get("symbol", "")
+        sym = a.get("symbol", "")
         if (a.get("tradable") and a.get("exchange") in ("NYSE", "NASDAQ", "AMEX")
-                and not any(x in s for x in (".WS", ".U", "$", "+"))):
-            syms.append(s)
-            names[s] = a.get("name", "")
+                and not any(x in sym for x in (".WS", ".U", "$", "+"))):
+            syms.append(sym)
+            names[sym] = a.get("name", "")
     return syms, names
+
+
+def _spx500():
+    # StringIO: otherwise pd.read_html mistakes the HTML string for a URL
+    # (lxml then throws FileNotFoundError trying to fetch it).
+    # Keep raw Wikipedia symbols (BRK.B, BF.B): Alpaca needs the dots.
+    from io import StringIO
+    html = requests.get(SPX_URL, headers=UA, timeout=30).text
+    tbl = pd.read_html(StringIO(html))[0]
+    syms = tbl["Symbol"].tolist()
+    return syms, dict(zip(syms, tbl["Security"]))
+
+
+@st.cache_data(ttl=86400, show_spinner="Loading stock universe…")
+def get_universe(mode):
+    """(tickers, names) for the chosen universe.
+
+    "S&P 500": the Wikipedia list. "Top 1000 by market cap": Alpaca's
+    listings ranked by Nasdaq screener caps (falls back to the S&P 500 with
+    a notice if the cap feed fails). "All listed stocks": everything.
+    """
+    if mode == "S&P 500":
+        return _spx500()
+    tickers_all, names_all = _alpaca_listings()
+    if mode == "Top 1000 by market cap":
+        try:
+            caps = get_market_caps()
+            ranked = sorted(((caps[s], s) for s in tickers_all if s in caps),
+                            reverse=True)
+            top = [s for _, s in ranked[:1000]]
+            if len(top) < 900:  # feed degraded; don't silently screen a stub
+                raise ValueError("market-cap feed too thin")
+            return top, {s: names_all[s] for s in top}
+        except Exception:
+            st.caption("⚠️ Market-cap feed was unreachable — screening the S&P 500 instead.")
+            return _spx500()
+    return tickers_all, names_all
 
 
 @st.cache_data(ttl=600, show_spinner="Volume pre-filtering all listings…")
@@ -373,11 +421,11 @@ def market_open_now() -> bool:
 with st.sidebar:
     st.header("Screen settings")
     st.selectbox("Universe",
-                 ["S&P 500", "All listed stocks"],
+                 ["S&P 500", "Top 1000 by market cap", "All listed stocks"],
                  index=1, key="universe",
-                 help="All listed stocks = every tradable NYSE/NASDAQ/AMEX equity (~11k). "
-                      "A snapshot-based volume pre-filter narrows them to the day's active "
-                      "names before the full screen runs — a full scan takes ~1–2 minutes.")
+                 help="Top 1000 = the 1,000 biggest US listings by market cap (Nasdaq screener, "
+                      "refreshed daily). All listed stocks = ~11k tickers with a snapshot-based "
+                      "volume pre-filter — a full scan takes ~1–2 minutes.")
     st.selectbox("Timeframe",
                  ["5 minutes", "15 minutes", "1 hour", "Since market open"],
                  index=3, key="timeframe",
@@ -395,7 +443,7 @@ with st.sidebar:
     st.caption(f"Feed: {_feed().upper()} · keys via Streamlit Secrets")
     if market_open_now():
         st.caption("🟢 Live: re-screens during market hours "
-                   "(~3 min per scan on All listed stocks, ~30s on S&P 500).")
+                   "(~3 min on All listed, ~1 min on Top 1000, ~30s on S&P 500).")
     else:
         st.caption("⚪ Market closed — showing the last session (no auto-refresh).")
 
@@ -425,13 +473,14 @@ def screener_body():
     # The fragment re-runs every 30s in market hours; it reads the sidebar
     # settings from session state (never as fragment args) so control changes
     # always take effect.
-    universe_mode = st.session_state.get("universe", "All listed stocks")
+    universe_mode = st.session_state.get("universe", "Top 1000 by market cap")
     timeframe = st.session_state.get("timeframe", "Since market open")
     relvol_min = st.session_state.get("relvol_min", 1.5)
     adx_min = st.session_state.get("adx_min", 25.0)
     rsi_lo, rsi_hi = st.session_state.get("rsi_band", (30, 70))
-    big = universe_mode != "S&P 500"
-    cadence = 180 if big else 25  # min seconds between full scans
+    big = universe_mode == "All listed stocks"
+    mid = universe_mode == "Top 1000 by market cap"
+    cadence = 180 if big else (60 if mid else 25)  # min seconds between full scans
     scan_key = (universe_mode, timeframe, relvol_min, adx_min, rsi_lo, rsi_hi)
 
     now = datetime.now(ET)
@@ -447,11 +496,11 @@ def screener_body():
     else:
         try:
             tickers, names = get_universe(universe_mode)
-            if big:
+            if universe_mode == "All listed stocks":
                 candidates = prefilter_by_volume(tickers)
                 uni_note = f"{len(tickers):,} listed · {len(candidates):,} passed volume pre-filter"
             else:
-                candidates, uni_note = tickers, f"{len(tickers)}"
+                candidates, uni_note = tickers, f"{len(tickers):,} ({universe_mode})"
             intra, intra_failed = fetch_intraday(candidates)
             daily, daily_failed = fetch_daily(candidates)
         except AlpacaAuthError as e:
