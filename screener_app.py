@@ -59,10 +59,12 @@ def _feed() -> str:
 def get_spx():
     # StringIO: otherwise pd.read_html mistakes the HTML string for a URL
     # (lxml then throws FileNotFoundError trying to fetch it).
+    # Keep raw Wikipedia symbols (BRK.B, BF.B): Alpaca needs the dots.
+    # (The dash form is only for Yahoo Finance.)
     from io import StringIO
     html = requests.get(SPX_URL, headers=UA, timeout=30).text
     tbl = pd.read_html(StringIO(html))[0]
-    syms = tbl["Symbol"].str.replace(".", "-", regex=False).tolist()
+    syms = tbl["Symbol"].tolist()
     names = dict(zip(syms, tbl["Security"]))
     return syms, names
 
@@ -78,47 +80,67 @@ def _bars_to_df(bars) -> pd.DataFrame:
     return df[["Open", "High", "Low", "Close", "Volume"]]
 
 
-@st.cache_data(ttl=30, show_spinner=False)
-def fetch_intraday(_tickers):
-    """1-min bars, refreshed on every 30s cycle (TTL 30). Threaded chunks."""
-    end = datetime.now(ET)
-    start = (end - timedelta(days=3)).replace(hour=0, minute=0, second=0, microsecond=0)
-    chunks = [_tickers[i:i + 200] for i in range(0, len(_tickers), 200)]
+class AlpacaAuthError(RuntimeError):
+    """Alpaca answered 401/403 — the API keys are rejected."""
+
+
+def _fetch_chunk(symbols, timeframe, start, end, limit):
+    """One multi-symbol bars request. Raises requests.HTTPError on failure."""
+    params = {"symbols": ",".join(symbols), "timeframe": timeframe,
+              "start": start.isoformat(), "end": end.isoformat(),
+              "limit": limit, "feed": _feed(), "adjustment": "raw", "sort": "desc"}
+    r = requests.get("https://data.alpaca.markets/v2/stocks/bars",
+                     headers=_headers(), params=params, timeout=60)
+    r.raise_for_status()
+    return {sym: _bars_to_df(bars)
+            for sym, bars in (r.json().get("bars") or {}).items() if bars}
+
+
+def _fetch_multi(tickers, timeframe, start, end, limit, chunk_size):
+    """Threaded multi-symbol fetch -> (bars_by_ticker, [(ticker, http_code)]).
+
+    A failed chunk is split and retried recursively, so one bad symbol can't
+    sink ~200 tickers or red-screen the app. A 401/403 raises AlpacaAuthError
+    (every chunk would fail the same way).
+    """
+    chunks = [tickers[i:i + chunk_size] for i in range(0, len(tickers), chunk_size)]
+    out, failed = {}, []
 
     def one(chunk):
-        params = {"symbols": ",".join(chunk), "timeframe": "1Min",
-                  "start": start.isoformat(), "end": end.isoformat(),
-                  "limit": 10000, "feed": _feed(), "adjustment": "raw", "sort": "desc"}
-        r = requests.get("https://data.alpaca.markets/v2/stocks/bars",
-                         headers=_headers(), params=params, timeout=60)
-        r.raise_for_status()
-        return {sym: _bars_to_df(bars)
-                for sym, bars in (r.json().get("bars") or {}).items() if bars}
+        try:
+            return _fetch_chunk(chunk, timeframe, start, end, limit), []
+        except requests.HTTPError as e:
+            code = e.response.status_code if e.response is not None else None
+            if code in (401, 403):
+                raise AlpacaAuthError(code)
+            if len(chunk) > 1:
+                mid = len(chunk) // 2
+                r1, f1 = one(chunk[:mid])
+                r2, f2 = one(chunk[mid:])
+                r1.update(r2)
+                return r1, f1 + f2
+            return {}, [(chunk[0], code)]
 
-    out = {}
     with ThreadPoolExecutor(max_workers=3) as ex:
-        for d in ex.map(one, chunks):
+        for d, f in ex.map(one, chunks):
             out.update(d)
-    return out
+            failed.extend(f)
+    return out, failed
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_intraday(_tickers):
+    """1-min bars, refreshed on every 30s cycle (TTL 30)."""
+    end = datetime.now(ET)
+    start = (end - timedelta(days=3)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return _fetch_multi(_tickers, "1Min", start, end, 10000, 200)
 
 
 @st.cache_data(ttl=3600, show_spinner="Pulling daily bars for volume baselines…")
 def fetch_daily(_tickers):
     end = datetime.now(ET)
     start = end - timedelta(days=45)
-    out = {}
-    for i in range(0, len(_tickers), 150):
-        chunk = _tickers[i:i + 150]
-        params = {"symbols": ",".join(chunk), "timeframe": "1D",
-                  "start": start.isoformat(), "end": end.isoformat(),
-                  "limit": 100, "feed": _feed(), "adjustment": "raw"}
-        r = requests.get("https://data.alpaca.markets/v2/stocks/bars",
-                         headers=_headers(), params=params, timeout=60)
-        r.raise_for_status()
-        for sym, bars in (r.json().get("bars") or {}).items():
-            if bars:
-                out[sym] = _bars_to_df(bars)
-    return out
+    return _fetch_multi(_tickers, "1D", start, end, 100, 150)
 
 
 # ---------------------------------------------------------------- indicators (vectorized Wilder's)
@@ -273,9 +295,24 @@ def screener_body():
     adx_min = st.session_state.get("adx_min", 25.0)
     rsi_lo, rsi_hi = st.session_state.get("rsi_band", (30, 70))
 
-    tickers, names = get_spx()
-    intra = fetch_intraday(tickers)
-    daily = fetch_daily(tickers)
+    try:
+        tickers, names = get_spx()
+        intra, intra_failed = fetch_intraday(tickers)
+        daily, daily_failed = fetch_daily(tickers)
+    except AlpacaAuthError as e:
+        code = e.args[0]
+        if code == 401:
+            st.error("Alpaca rejected the API keys (HTTP 401). In **this** app's Settings → Secrets, "
+                     "re-check APCA_API_KEY_ID and APCA_API_SECRET_KEY — secrets don't copy over to a "
+                     "new app automatically, and a typo when pasting is the usual cause.")
+        else:
+            st.error(f"Alpaca refused the request (HTTP {code}) — the keys may lack market-data access.")
+        st.stop()
+
+    skipped = sorted({t for t, _ in intra_failed} | {t for t, _ in daily_failed})
+    if skipped:
+        st.warning(f"Skipped {len(skipped)} tickers Alpaca wouldn't serve: "
+                   f"{', '.join(skipped[:10])}{' …' if len(skipped) > 10 else ''}")
 
     bull, bear, session_date = screen(intra, daily, names, window_end,
                                      relvol_min, adx_min, rsi_lo, rsi_hi)
