@@ -57,8 +57,11 @@ def _feed() -> str:
 # ---------------------------------------------------------------- universe
 @st.cache_data(ttl=86400, show_spinner="Loading S&P 500 list…")
 def get_spx():
+    # StringIO: otherwise pd.read_html mistakes the HTML string for a URL
+    # (lxml then throws FileNotFoundError trying to fetch it).
+    from io import StringIO
     html = requests.get(SPX_URL, headers=UA, timeout=30).text
-    tbl = pd.read_html(html)[0]
+    tbl = pd.read_html(StringIO(html))[0]
     syms = tbl["Symbol"].str.replace(".", "-", regex=False).tolist()
     names = dict(zip(syms, tbl["Security"]))
     return syms, names
