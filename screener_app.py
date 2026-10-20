@@ -537,6 +537,11 @@ def screener_body():
     st.info(f"**{n_scan}** tickers scanned · {uni_label} · session **{asof}** · "
             f"**{len(bull)}** bullish / **{len(bear)}** bearish matches · "
             f"updated {refreshed}", icon="📊")
+    _now = datetime.now(ET)
+    if session_date == _now.date() and _now.time() < time(10, 0):
+        st.caption("⏳ Early session: the screen needs 29 bars before ADX can compute, so the "
+                   "earliest any stock can qualify is ~09:59 ET — and the opening range doesn't "
+                   "complete until 10:00 ET. An empty list before then is expected, not a glitch.")
 
     tf_slug = timeframe.replace(" ", "_")
     tab_bull, tab_bear = st.tabs([f"🟢 Bullish ({len(bull)})", f"🔴 Bearish ({len(bear)})"])
