@@ -167,7 +167,7 @@ def adx_vec(high: pd.Series, low: pd.Series, close: pd.Series, n: int = 14):
 
 # ---------------------------------------------------------------- screen
 def screen(intraday, daily, names, window_end, relvol_min, adx_min, rsi_lo, rsi_hi):
-    bull, bear = [], []
+    bull, bear, session_date = [], [], None
     for t, df in intraday.items():
         try:
             if df.empty:
@@ -227,8 +227,12 @@ def screen(intraday, daily, names, window_end, relvol_min, adx_min, rsi_lo, rsi_
                 bear.append(row)
         except Exception:
             continue
-    b = pd.DataFrame(bull).sort_values("RelVol", ascending=False)
-    br = pd.DataFrame(bear).sort_values("RelVol", ascending=False)
+    b = pd.DataFrame(bull)
+    if len(b):
+        b = b.sort_values("RelVol", ascending=False)
+    br = pd.DataFrame(bear)
+    if len(br):
+        br = br.sort_values("RelVol", ascending=False)
     return b, br, session_date
 
 
@@ -316,6 +320,10 @@ def screener_body():
 
     bull, bear, session_date = screen(intra, daily, names, window_end,
                                      relvol_min, adx_min, rsi_lo, rsi_hi)
+    if session_date is None:
+        st.error("Alpaca returned no bars for any ticker — check the app logs, "
+                 "or try Refresh now in a moment.")
+        st.stop()
 
     asof = (f"{session_date} as of {window_end} ET" if window_end != "16:00"
             else f"{session_date} full session")
