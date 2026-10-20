@@ -544,11 +544,14 @@ def screener_body():
                    "complete until 10:00 ET. An empty list before then is expected, not a glitch.")
 
     tf_slug = timeframe.replace(" ", "_")
-    tab_bull, tab_bear = st.tabs([f"🟢 Bullish ({len(bull)})", f"🔴 Bearish ({len(bear)})"])
+    TOP_N = 10  # display cap per tab (tables are RelVol-sorted; CSVs stay full)
+    bull_show, bear_show = bull.head(TOP_N), bear.head(TOP_N)
+    tab_bull, tab_bear = st.tabs([f"🟢 Bullish (top {len(bull_show)} of {len(bull)})",
+                                  f"🔴 Bearish (top {len(bear_show)} of {len(bear)})"])
     with tab_bull:
         if len(bull):
-            st.dataframe(bull, column_config=_cols, use_container_width=True, hide_index=True)
-            st.download_button("Download bullish CSV",
+            st.dataframe(bull_show, column_config=_cols, use_container_width=True, hide_index=True)
+            st.download_button(f"Download full bullish CSV ({len(bull)})",
                                bull.to_csv(index=False).encode(),
                                f"bullish_{session_date}_{tf_slug}.csv",
                                "text/csv")
@@ -556,8 +559,8 @@ def screener_body():
             st.write("No bullish matches — try loosening relative volume or ADX, or a wider timeframe.")
     with tab_bear:
         if len(bear):
-            st.dataframe(bear, column_config=_cols, use_container_width=True, hide_index=True)
-            st.download_button("Download bearish CSV",
+            st.dataframe(bear_show, column_config=_cols, use_container_width=True, hide_index=True)
+            st.download_button(f"Download full bearish CSV ({len(bear)})",
                                bear.to_csv(index=False).encode(),
                                f"bearish_{session_date}_{tf_slug}.csv",
                                "text/csv")
