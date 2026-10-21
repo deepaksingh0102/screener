@@ -350,7 +350,7 @@ def screen(intraday, daily, names, timeframe, relvol_min, adx_min, rsi_lo, rsi_h
             session_date = df.index.date.max()
             # Full regular session: indicators get the whole session's warm-up.
             day = df[df.index.date == session_date].between_time("09:30", "16:00")
-            if len(day) < 29:  # ADX(14) needs 2n+1 bars
+            if len(day) < 10:  # the EMA+MACD pair net needs only a few bars
                 continue
             o, h, l, c = day["Open"], day["High"], day["Low"], day["Close"]
             v = day["Volume"].fillna(0.0)
@@ -362,13 +362,7 @@ def screen(intraday, daily, names, timeframe, relvol_min, adx_min, rsi_lo, rsi_h
             sig = macd.ewm(span=9, adjust=False).mean().iloc[-1]
             macd = macd.iloc[-1]
             rsi = wilder_rsi(c).iloc[-1]
-            vwap = ((h + l + c) / 3.0 * v).cumsum().iloc[-1] / v.cumsum().iloc[-1]
-            adx, _, _ = adx_vec(h, l, c)
-            adx = adx.iloc[-1]
             price = float(c.iloc[-1])
-
-            orw = day.between_time("09:30", "10:00")
-            orh, orl = float(orw["High"].max()), float(orw["Low"].min())
 
             d = daily.get(t)
             prev_close, pct_chg, avg_vol = np.nan, np.nan, np.nan
@@ -386,6 +380,28 @@ def screen(intraday, daily, names, timeframe, relvol_min, adx_min, rsi_lo, rsi_h
             win_min = max((win.index[-1] - win.index[0]).total_seconds() / 60 + 1, 1)
             relvol = (float(win["Volume"].fillna(0.0).sum()) / (avg_vol * win_min / 390.0)
                       if avg_vol and avg_vol > 0 else np.nan)
+
+            # The 2-condition confluence net (EMA + MACD only) is collected
+            # here — before the strict screen's 29-bar ADX warm-up — so it
+            # populates from ~09:40 ET while the 7-filter lists are still
+            # warming up. Early MACD readings are young; treat them as such.
+            pair_row = dict(Ticker=t, Name=names.get(t, ""),
+                            Price=round(price, 2), Chg_Pct=round(pct_chg, 2),
+                            EMA9=round(ema9, 2), EMA21=round(ema21, 2),
+                            MACD=round(macd, 3), Signal=round(sig, 3),
+                            RSI=round(rsi, 1), RelVol=round(relvol, 2))
+            if ema9 > ema21 and macd > sig:
+                pair_bull.append(pair_row)
+            elif ema9 < ema21 and macd < sig:
+                pair_bear.append(pair_row)
+
+            if len(day) < 29:  # ADX(14) needs 2n+1 bars — strict screen only
+                continue
+            vwap = ((h + l + c) / 3.0 * v).cumsum().iloc[-1] / v.cumsum().iloc[-1]
+            adx, _, _ = adx_vec(h, l, c)
+            adx = adx.iloc[-1]
+            orw = day.between_time("09:30", "10:00")
+            orh, orl = float(orw["High"].max()), float(orw["Low"].min())
 
             row = dict(Ticker=t, Name=names.get(t, ""), Price=round(price, 2),
                        Chg_Pct=round(pct_chg, 2), EMA9=round(ema9, 2),
@@ -405,12 +421,6 @@ def screen(intraday, daily, names, timeframe, relvol_min, adx_min, rsi_lo, rsi_h
             elif (ema9 < ema21 and macd < sig and rsi_ok and price < vwap
                     and in_or and vol_ok and adx_ok):
                 bear.append(row)
-            # The 2-condition confluence net: EMA + MACD only, none of the
-            # other five gates — a wider candidate list, shown separately.
-            if ema9 > ema21 and macd > sig:
-                pair_bull.append(row)
-            elif ema9 < ema21 and macd < sig:
-                pair_bear.append(row)
         except Exception:
             continue
     b = pd.DataFrame(bull)
@@ -482,8 +492,8 @@ def breakout_screen(intraday, daily, names, timeframe, relvol_min, rsi_lo, rsi_h
 
             # The 2-condition confluence net (EMA + MACD only) is collected
             # before this mode's RSI/relvol gate — it answers to no other
-            # filter. Same 29-bar warm-up as Momentum mode's MACD.
-            if len(day) >= 29:
+            # filter. This loop's own floor already guarantees 20 bars.
+            if len(day) >= 20:
                 pair_row = dict(Ticker=t, Name=names.get(t, ""),
                                 Price=round(price, 2), Chg_Pct=round(pct_chg, 2),
                                 EMA9=round(ema9, 2), EMA21=round(ema21, 2),
@@ -732,11 +742,14 @@ def screener_body():
         if breakout:
             st.caption("⏳ Early session: the stochastic needs ~17 bars of warm-up, so the earliest "
                        "breakouts can qualify is ~09:50 ET — and opening-range breaks only count after "
-                       "10:00 ET. An empty list before then is expected, not a glitch.")
+                       "10:00 ET. An empty list before then is expected, not a glitch. The EMA + MACD "
+                       "lists below also start at ~09:50 ET.")
         else:
             st.caption("⏳ Early session: the screen needs 29 bars before ADX can compute, so the "
                        "earliest any stock can qualify is ~09:59 ET — and the opening range doesn't "
-                       "complete until 10:00 ET. An empty list before then is expected, not a glitch.")
+                       "complete until 10:00 ET. An empty list before then is expected, not a glitch. "
+                       "The EMA + MACD lists below start earlier, at ~09:40 ET (10 bars) — early "
+                       "MACD readings are still warming up.")
 
     tf_slug = timeframe.replace(" ", "_")
     mode_slug = "breakout" if breakout else "momentum"
