@@ -341,7 +341,7 @@ def stoch_kd(high: pd.Series, low: pd.Series, close: pd.Series,
 
 # ---------------------------------------------------------------- screen
 def screen(intraday, daily, names, timeframe, relvol_min, adx_min, rsi_lo, rsi_hi):
-    bull, bear, session_date = [], [], None
+    bull, bear, pair_bull, pair_bear, session_date = [], [], [], [], None
     trail = TF_TRAILING[timeframe]
     for t, df in intraday.items():
         try:
@@ -405,6 +405,12 @@ def screen(intraday, daily, names, timeframe, relvol_min, adx_min, rsi_lo, rsi_h
             elif (ema9 < ema21 and macd < sig and rsi_ok and price < vwap
                     and in_or and vol_ok and adx_ok):
                 bear.append(row)
+            # The 2-condition confluence net: EMA + MACD only, none of the
+            # other five gates — a wider candidate list, shown separately.
+            if ema9 > ema21 and macd > sig:
+                pair_bull.append(row)
+            elif ema9 < ema21 and macd < sig:
+                pair_bear.append(row)
         except Exception:
             continue
     b = pd.DataFrame(bull)
@@ -413,7 +419,13 @@ def screen(intraday, daily, names, timeframe, relvol_min, adx_min, rsi_lo, rsi_h
     br = pd.DataFrame(bear)
     if len(br):
         br = br.sort_values("RelVol", ascending=False)
-    return b, br, session_date
+    pb = pd.DataFrame(pair_bull)
+    if len(pb):
+        pb = pb.sort_values("RelVol", ascending=False)
+    pbr = pd.DataFrame(pair_bear)
+    if len(pbr):
+        pbr = pbr.sort_values("RelVol", ascending=False)
+    return b, br, pb, pbr, session_date
 
 
 def breakout_screen(intraday, daily, names, timeframe, relvol_min, rsi_lo, rsi_hi):
@@ -422,7 +434,7 @@ def breakout_screen(intraday, daily, names, timeframe, relvol_min, rsi_lo, rsi_h
     stochastic momentum shift (fresh %K/%D cross, or %K beyond 80/20), real
     volume, and no wick rejection on the crossing candle. The most recent
     cross must be within 30 bars and price must still hold the level."""
-    bull, bear, session_date = [], [], None
+    bull, bear, pair_bull, pair_bear, session_date = [], [], [], [], None
     trail = TF_TRAILING[timeframe]
     for t, df in intraday.items():
         try:
@@ -436,6 +448,10 @@ def breakout_screen(intraday, daily, names, timeframe, relvol_min, rsi_lo, rsi_h
             price = float(c.iloc[-1])
             ema9 = c.ewm(span=9, adjust=False).mean().iloc[-1]
             ema21 = c.ewm(span=21, adjust=False).mean().iloc[-1]
+            macd_s = (c.ewm(span=12, adjust=False).mean()
+                      - c.ewm(span=26, adjust=False).mean())
+            sig = macd_s.ewm(span=9, adjust=False).mean().iloc[-1]
+            macd_v = macd_s.iloc[-1]
             rsi = wilder_rsi(c).iloc[-1]
             pk, pd_ = stoch_kd(h, l, c)
             k_now, d_now = float(pk.iloc[-1]), float(pd_.iloc[-1])
@@ -463,6 +479,20 @@ def breakout_screen(intraday, daily, names, timeframe, relvol_min, rsi_lo, rsi_h
             win_min = max((win.index[-1] - win.index[0]).total_seconds() / 60 + 1, 1)
             relvol = (float(win["Volume"].fillna(0.0).sum()) / (avg_vol * win_min / 390.0)
                       if avg_vol and avg_vol > 0 else np.nan)
+
+            # The 2-condition confluence net (EMA + MACD only) is collected
+            # before this mode's RSI/relvol gate — it answers to no other
+            # filter. Same 29-bar warm-up as Momentum mode's MACD.
+            if len(day) >= 29:
+                pair_row = dict(Ticker=t, Name=names.get(t, ""),
+                                Price=round(price, 2), Chg_Pct=round(pct_chg, 2),
+                                EMA9=round(ema9, 2), EMA21=round(ema21, 2),
+                                MACD=round(macd_v, 3), Signal=round(sig, 3),
+                                RSI=round(rsi, 1), RelVol=round(relvol, 2))
+                if ema9 > ema21 and macd_v > sig:
+                    pair_bull.append(pair_row)
+                elif ema9 < ema21 and macd_v < sig:
+                    pair_bear.append(pair_row)
 
             if not (rsi_lo < rsi < rsi_hi) or not (relvol >= relvol_min):
                 continue
@@ -527,7 +557,13 @@ def breakout_screen(intraday, daily, names, timeframe, relvol_min, rsi_lo, rsi_h
     br = pd.DataFrame(bear)
     if len(br):
         br = br.sort_values("RelVol", ascending=False)
-    return b, br, session_date
+    pb = pd.DataFrame(pair_bull)
+    if len(pb):
+        pb = pb.sort_values("RelVol", ascending=False)
+    pbr = pd.DataFrame(pair_bear)
+    if len(pbr):
+        pbr = pbr.sort_values("RelVol", ascending=False)
+    return b, br, pb, pbr, session_date
 
 
 # ---------------------------------------------------------------- UI
@@ -609,6 +645,11 @@ _cols_bo = {"Ticker": st.column_config.TextColumn("Ticker"),
             "Wick_Pct": st.column_config.NumberColumn("Wick %", format="%.0f%%"),
             "RelVol": st.column_config.NumberColumn("RelVol", format="%.2fx")}
 
+# The EMA + MACD confluence lists show the same columns in both screen modes.
+_pair_display = ["Ticker", "Name", "Price", "Chg_Pct", "EMA9", "EMA21",
+                 "MACD", "Signal", "RSI", "RelVol"]
+_cols_pair = {k: _cols[k] for k in _pair_display}
+
 
 @st.fragment(run_every=30 if market_open_now() else None)
 def screener_body():
@@ -635,7 +676,7 @@ def screener_body():
     if (cached and cached[0] == scan_key and not force and last_ts
             and (now - last_ts).total_seconds() < cadence):
         # Serve the previous scan; a full re-scan runs on the next cycle.
-        bull, bear, session_date, asof, uni_label, n_scan = cached[1:]
+        bull, bear, pair_bull, pair_bear, session_date, asof, uni_label, n_scan = cached[1:]
         wait = int(cadence - (now - last_ts).total_seconds())
         st.caption(f"⏳ Next full scan in ~{wait}s — showing the last completed scan.")
     else:
@@ -664,11 +705,11 @@ def screener_body():
                        f"{', '.join(skipped[:10])}{' …' if len(skipped) > 10 else ''}")
 
         if breakout:
-            bull, bear, session_date = breakout_screen(intra, daily, names, timeframe,
-                                                       relvol_min, rsi_lo, rsi_hi)
+            bull, bear, pair_bull, pair_bear, session_date = breakout_screen(
+                intra, daily, names, timeframe, relvol_min, rsi_lo, rsi_hi)
         else:
-            bull, bear, session_date = screen(intra, daily, names, timeframe,
-                                              relvol_min, adx_min, rsi_lo, rsi_hi)
+            bull, bear, pair_bull, pair_bear, session_date = screen(
+                intra, daily, names, timeframe, relvol_min, adx_min, rsi_lo, rsi_hi)
         if session_date is None:
             st.error("Alpaca returned no bars for any ticker — check the app logs, "
                      "or try Refresh now in a moment.")
@@ -678,8 +719,8 @@ def screener_body():
                 else f"{session_date} · since market open")
         uni_label = uni_note
         n_scan = len(intra)
-        st.session_state["_last_scan"] = (scan_key, bull, bear, session_date,
-                                          asof, uni_label, n_scan)
+        st.session_state["_last_scan"] = (scan_key, bull, bear, pair_bull, pair_bear,
+                                          session_date, asof, uni_label, n_scan)
         st.session_state["_last_scan_ts"] = datetime.now(ET)
 
     refreshed = datetime.now(ET).strftime("%H:%M:%S ET")
@@ -724,6 +765,36 @@ def screener_body():
         else:
             st.write("No bearish matches — try loosening relative volume"
                      + (" or the RSI band." if breakout else " or ADX, or a wider timeframe."))
+
+    st.markdown("#### EMA + MACD confluence — the 2-condition net")
+    st.caption("Only the two trend conditions — EMA9 vs EMA21 and MACD vs signal. No RSI, "
+               "VWAP, opening-range, volume or ADX gates, so this list is much wider and "
+               "weaker than the screen above: candidates for a closer look, not matches.")
+    pair_bull_show = pair_bull.head(TOP_N)
+    pair_bear_show = pair_bear.head(TOP_N)
+    ptab_bull, ptab_bear = st.tabs(
+        [f"🟢 EMA+MACD Bullish (top {len(pair_bull_show)} of {len(pair_bull)})",
+         f"🔴 EMA+MACD Bearish (top {len(pair_bear_show)} of {len(pair_bear)})"])
+    with ptab_bull:
+        if len(pair_bull):
+            st.dataframe(pair_bull_show[_pair_display], column_config=_cols_pair,
+                         use_container_width=True, hide_index=True)
+            st.download_button(f"Download full EMA+MACD bullish CSV ({len(pair_bull)})",
+                               pair_bull.to_csv(index=False).encode(),
+                               f"ema_macd_bullish_{session_date}_{tf_slug}.csv",
+                               "text/csv")
+        else:
+            st.write("No stocks with EMA9 > EMA21 and MACD > signal right now.")
+    with ptab_bear:
+        if len(pair_bear):
+            st.dataframe(pair_bear_show[_pair_display], column_config=_cols_pair,
+                         use_container_width=True, hide_index=True)
+            st.download_button(f"Download full EMA+MACD bearish CSV ({len(pair_bear)})",
+                               pair_bear.to_csv(index=False).encode(),
+                               f"ema_macd_bearish_{session_date}_{tf_slug}.csv",
+                               "text/csv")
+        else:
+            st.write("No stocks with EMA9 < EMA21 and MACD < signal right now.")
 
     with st.expander("How the filters work"):
         if breakout:
